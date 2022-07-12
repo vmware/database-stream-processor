@@ -396,7 +396,9 @@ mod test {
             let edges = circuit
                     .add_source(Generator::new(move || edges.next().unwrap()));
 
-            let (paths, reverse_paths) = circuit.recursive(|child, (paths, reverse_paths): (Stream<_, OrdZSet<(usize, usize), isize>>, Stream<_, OrdZSet<(usize, usize), isize>>)| {
+            type PathStream<C> = Stream<C, OrdZSet<(usize, usize), isize>>;
+
+            let (paths, reverse_paths) = circuit.recursive(|child, (paths, reverse_paths): (PathStream<_>, PathStream<_>)| {
                 let edges = edges.delta0(child);
 
                 let paths_indexed = paths.index_with(|&(x, y)| (y, x));
