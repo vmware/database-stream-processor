@@ -41,6 +41,8 @@ zstd = "0.10.0"
 anyhow = "1.0.57"
 cached = "0.37.0"
 rstest = "0.15.0"
+proptest = "1.0.0"
+rand_xoshiro = "0.6.0"
 ordered-float = "3.0.0"
 indicatif = "0.17.0-rc.11"
 clap = { version = "3.2.8", features = ["derive", "env"] }
@@ -59,6 +61,10 @@ harness = false
 name = "nexmark"
 harness = false
 required-features = ["with-nexmark"]
+
+[[bench]]
+name = "consolidation"
+harness = false
 
 [[bench]]
 name = "ldbc-graphalytics"

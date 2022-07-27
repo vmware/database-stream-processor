@@ -360,6 +360,8 @@ mod test {
     // tuples: compute forward and backward reachability at the same time.
     #[test]
     fn reachability2() {
+        type Edges<S> = Stream<S, OrdZSet<(usize, usize), isize>>;
+
         let root = Root::build(move |circuit| {
             // Changes to the edges relation.
             let mut edges = vec![
@@ -396,9 +398,7 @@ mod test {
             let edges = circuit
                     .add_source(Generator::new(move || edges.next().unwrap()));
 
-            type PathStream<C> = Stream<C, OrdZSet<(usize, usize), isize>>;
-
-            let (paths, reverse_paths) = circuit.recursive(|child, (paths, reverse_paths): (PathStream<_>, PathStream<_>)| {
+            let (paths, reverse_paths) = circuit.recursive(|child, (paths, reverse_paths): (Edges<_>, Edges<_>)| {
                 let edges = edges.delta0(child);
 
                 let paths_indexed = paths.index_with(|&(x, y)| (y, x));

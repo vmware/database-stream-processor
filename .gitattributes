@@ -1,1 +1,2 @@
-Cargo.lock merge=binary
+Cargo.lock merge=binary linguist-generated=true
+proptest-regressions/**/* -diff linguist-generated=true

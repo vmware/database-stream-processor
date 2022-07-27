@@ -1,5 +1,5 @@
 #![feature(generic_associated_types)]
-#![feature(is_some_with)]
+#![cfg_attr(feature = "with-nexmark", feature(is_some_with))]
 
 mod num_entries;
 mod ref_pair;

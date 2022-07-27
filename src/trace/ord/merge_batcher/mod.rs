@@ -11,8 +11,9 @@ use deepsize::DeepSizeOf;
 use std::{
     cmp::Ordering,
     collections::VecDeque,
+    fmt::Debug,
     marker::PhantomData,
-    mem::{replace, size_of, swap, take},
+    mem::{replace, size_of, take},
 };
 
 mod tests;
@@ -59,16 +60,25 @@ where
     // the previously used `upper`, which we call `lower`, by assumption that
     // after sealing a batcher we receive no more updates with times not greater
     // or equal to `upper`.
+    // TODO: Since sealing takes self by value all of the buffers we've collected
+    //       are just discarded, which isn't ideal
+    // TODO: Should we just merge batches until completion instead of having
+    //       the inner builder do it?
     fn seal(mut self) -> B {
         let mut merged = Vec::new();
         self.sorter.finish_into(&mut merged);
 
         // Try and pre-allocate our builder a little bit
+        // TODO: We could potentially maintain a count of elements
+        //       within the sorter, could that be worth it?
         let mut builder = B::Builder::with_capacity(self.time.clone(), merged.len() * 4);
 
         for mut buffer in merged.drain(..) {
-            // TODO: Re-use buffer, rather than dropping.
             builder.extend(buffer.drain(..).map(|((key, val), diff)| (key, val, diff)));
+
+            if buffer.capacity() >= MergeSorter::<(K, V), R>::BUFFER_ELEMENTS {
+                self.sorter.stash.push(buffer);
+            }
         }
 
         builder.done()
@@ -89,8 +99,13 @@ where
     }
 }
 
+#[derive(Debug)]
 struct MergeSorter<D: Ord, R: MonoidValue> {
-    queue: Vec<Vec<Vec<(D, R)>>>, // each power-of-two length list of allocations.
+    /// Queue's invariant is not that every `Vec<Vec<(D, R)>>` is sorted
+    /// relative to each other but instead that within each `Vec<Vec<(D, R)>>`
+    /// every inner `Vec<(D, R)>` is sorted by `D` relative to the rest of the
+    /// vecs within its current batch
+    queue: Vec<Vec<Vec<(D, R)>>>,
     stash: Vec<Vec<(D, R)>>,
 }
 
@@ -147,6 +162,11 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
             empty.is_empty(),
             "popped a stashed buffer that wasn't empty",
         );
+        debug_assert_ne!(
+            empty.capacity(),
+            0,
+            "popped a stashed buffer with zero capacity",
+        );
 
         empty
     }
@@ -171,22 +191,26 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
 
             // Consolidate and push the batch we were given
             consolidation::consolidate(&mut batch);
-            self.queue.push(vec![batch]);
+            if !batch.is_empty() {
+                self.queue.push(vec![batch]);
 
-            // While there's at least two elements in our queue and one
-            // of them is much larger than the other
-            while self.queue.len() > 1
-                && (self.queue[self.queue.len() - 1].len()
-                    >= self.queue[self.queue.len() - 2].len() / 2)
-            {
-                let (left, right) = (
-                    self.queue.pop().expect("there's at least two batches"),
-                    self.queue.pop().expect("there's at least two batches"),
-                );
+                // While there's at least two elements in our queue and one
+                // of them is much larger than the other
+                while self.queue.len() > 1
+                    && (self.queue[self.queue.len() - 1].len()
+                        >= self.queue[self.queue.len() - 2].len() / 2)
+                {
+                    let (left, right) = (
+                        self.queue.pop().expect("there's at least two batches"),
+                        self.queue.pop().expect("there's at least two batches"),
+                    );
 
-                // Merge the two batches together
-                let merged = self.merge_by(left, right);
-                self.queue.push(merged);
+                    // Merge the two batches together
+                    let merged = self.merge_by(left, right);
+                    if !merged.is_empty() {
+                        self.queue.push(merged);
+                    }
+                }
             }
         }
     }
@@ -196,27 +220,48 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
         while self.queue.len() >= 2 {
             let list1 = self.queue.pop().unwrap();
             let list2 = self.queue.pop().unwrap();
+
             let merged = self.merge_by(list1, list2);
-            self.queue.push(merged);
+            if !merged.is_empty() {
+                self.queue.push(merged);
+            }
         }
 
-        if let Some(mut last) = self.queue.pop() {
-            swap(&mut last, target);
+        if let Some(last) = self.queue.pop() {
+            // TODO: Reuse the `target` buffer somehow
+            *target = last;
         }
         debug_assert!(self.queue.is_empty());
     }
 
     // merges two sorted input lists into one sorted output list.
-    #[inline(never)]
-    fn merge_by(&mut self, list1: Vec<Vec<(D, R)>>, list2: Vec<Vec<(D, R)>>) -> Vec<Vec<(D, R)>> {
+    // TODO: Split this into two functions:
+    //       - `fn merge_batch(Vec<(D, R)>, Vec<(D, R)>) -> Vec<(D, R)>`
+    //       - `fn merge_batches(Vec<Vec<(D, R)>>, Vec<Vec<(D, R)>>) -> Vec<Vec<(D,
+    //         R)>>`
+    // TODO: There's some things that need to be evaluated/tested/benchmarked here:
+    //       - When getting a new head1/head2 after the inner merge happens, is it
+    //         beneficial to pop from the opposite list (list1/list2) when one of
+    //         them is exhausted?
+    //       - Whenever we push a batch to `output` we lose the ability to merge
+    //         anything else into it, this can somewhat restrict the amount of
+    //         merging we can possibly do and can lead to missed opportunities
+    fn merge_by(
+        &mut self,
+        mut list1: Vec<Vec<(D, R)>>,
+        mut list2: Vec<Vec<(D, R)>>,
+    ) -> Vec<Vec<(D, R)>> {
+        // Remove all empty batches from the inputs
+        list1.retain(|batch| !batch.is_empty());
+        list2.retain(|batch| !batch.is_empty());
+
+        let (mut list1, mut list2) = (VecDeque::from(list1), VecDeque::from(list2));
+
         // Ensure all the batches we've been given are in sorted order
         if cfg!(debug_assertions) {
-            for batch in &list1 {
-                assert!(batch.windows(2).all(|window| window[0].0 <= window[1].0));
-            }
-
-            for batch in &list2 {
-                assert!(batch.windows(2).all(|window| window[0].0 <= window[1].0));
+            for batch in list1.iter().chain(&list2) {
+                assert!(!batch.is_empty());
+                assert!(batch.is_sorted_by(|(a, _), (b, _)| Some(a.cmp(b))));
             }
         }
 
@@ -224,14 +269,13 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
         let mut output = Vec::with_capacity(list1.len() + list2.len());
         let mut result = self.buffer();
 
-        let mut list1 = VecDeque::from(list1);
-        let mut list2 = VecDeque::from(list2);
-
         let mut head1 = list1.pop_front().map_or_else(VecDeque::new, VecDeque::from);
         let mut head2 = list2.pop_front().map_or_else(VecDeque::new, VecDeque::from);
 
         // while we have valid data in each input, merge.
         while !head1.is_empty() && !head2.is_empty() {
+            debug_assert!(result.is_sorted_by(|(a, _), (b, _)| Some(a.cmp(b))));
+
             // Iterate while the result vec has spare capacity (and therefore can be pushed
             // to) and both `head1` and `head2` are non-empty
             while result.has_spare_capacity() && !head1.is_empty() && !head2.is_empty() {
@@ -252,9 +296,10 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
                         // Merge the diff values of both elements
                         let (data, mut diff1) =
                             head1.pop_front().expect("there's at least one element");
-                        // We can safely discard the second data value since we've checked
-                        // that both data values are equal
-                        let (_, diff2) = head2.pop_front().expect("there's at least one element");
+                        let (data2, diff2) =
+                            head2.pop_front().expect("there's at least one element");
+
+                        debug_assert!(data == data2);
                         diff1.add_assign_by_ref(&diff2);
 
                         // If merging the two values returns zero, discard the element
@@ -268,26 +313,34 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
                     }
                 };
 
+                if cfg!(debug_assertions) {
+                    if let Some((last, _)) = result.last() {
+                        debug_assert!(last <= &merged.0);
+                    }
+                }
+
                 // Safety: We've checked that the current vec has spare capacity available
                 //         as part of the loop's condition
                 debug_assert!(result.has_spare_capacity());
                 unsafe { result.push_unchecked(merged) };
             }
 
-            if result.capacity() == result.len() {
+            debug_assert!(result.is_sorted_by(|(a, _), (b, _)| Some(a.cmp(b))));
+            if !result.has_spare_capacity() {
                 output.push(result);
                 result = self.buffer();
             }
 
             if head1.is_empty() {
-                if head1.capacity() == Self::BUFFER_ELEMENTS {
+                if head1.capacity() >= Self::BUFFER_ELEMENTS {
                     self.stash.push(Vec::from(head1));
                 }
 
                 head1 = list1.pop_front().map_or_else(VecDeque::new, VecDeque::from);
             }
+
             if head2.is_empty() {
-                if head2.capacity() == Self::BUFFER_ELEMENTS {
+                if head2.capacity() >= Self::BUFFER_ELEMENTS {
                     self.stash.push(Vec::from(head2));
                 }
 
@@ -296,23 +349,35 @@ impl<D: Ord, R: MonoidValue> MergeSorter<D, R> {
         }
 
         if !result.is_empty() {
+            debug_assert!(result.is_sorted_by(|(a, _), (b, _)| Some(a.cmp(b))));
             output.push(result);
-        } else if result.capacity() > 0 {
+        } else if result.capacity() >= Self::BUFFER_ELEMENTS {
             self.stash.push(result);
         }
 
+        let head1 = Vec::from(head1);
         if !head1.is_empty() {
-            output.push(Vec::from(head1));
+            // Our result buffer should be in sorted order
+            debug_assert!(head1.is_sorted_by(|(a, _), (b, _)| Some(a.cmp(b))));
+            output.push(head1);
+        } else if head1.capacity() >= Self::BUFFER_ELEMENTS {
+            self.stash.push(head1);
         }
         output.extend(list1);
 
+        let head2 = Vec::from(head2);
         if !head2.is_empty() {
-            output.push(Vec::from(head2));
+            // Our result buffer should be in sorted order
+            debug_assert!(head2.is_sorted_by(|(a, _), (b, _)| Some(a.cmp(b))));
+            output.push(head2);
+        } else if head2.capacity() >= Self::BUFFER_ELEMENTS {
+            self.stash.push(head2);
         }
         output.extend(list2);
 
-        // Filter out empty batches
-        output.retain(|batch| !batch.is_empty());
+        // None of the batches we output should be empty
+        debug_assert!(output.iter().all(|batch| !batch.is_empty()));
+
         output
     }
 
