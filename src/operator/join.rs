@@ -21,7 +21,6 @@ use std::{
     fmt::Write,
     hash::Hash,
     marker::PhantomData,
-    mem::take,
 };
 use timely::PartialOrder;
 
@@ -206,23 +205,15 @@ where
 
         let left_trace = left.trace::<OrdValSpine<I1::Key, I1::Val, TS, I1::R>>();
         let right_trace = right.trace::<OrdValSpine<I1::Key, I2::Val, TS, I1::R>>();
-        let join_func_clone = join_func.clone();
 
-        let left =
-            self.circuit()
-                .add_binary_operator(JoinTrace::new(join_func), &left, &right_trace);
-
-        // This function does not do anything, it's only needed to tell the compiler
-        // about the type of `f`.
-        fn assert_type<F, K, V1, V2, V>(f: F) -> F
-        where
-            F: Fn(&K, &V1, &V2) -> V,
-        {
-            f
-        }
+        let left = self.circuit().add_binary_operator(
+            JoinTrace::new(join_func.clone()),
+            &left,
+            &right_trace,
+        );
 
         let right = self.circuit().add_binary_operator(
-            JoinTrace::new(assert_type(move |k, v2, v1| join_func_clone(k, v1, v2))),
+            JoinTrace::new(move |k: &I1::Key, v2: &I2::Val, v1: &I1::Val| join_func(k, v1, v2)),
             &right,
             &left_trace.delay_trace(),
         );
@@ -258,6 +249,7 @@ where
     fn name(&self) -> Cow<'static, str> {
         Cow::from("Join")
     }
+
     fn fixedpoint(&self, _scope: Scope) -> bool {
         true
     }
@@ -476,19 +468,19 @@ where
         // Sort `output_tuples` by timestamp and push all tuples for each unique
         // timestamp to the appropriate batcher.
         output_tuples.sort_by(|(t1, _), (t2, _)| t1.cmp(t2));
-        let mut start = 0;
-        while start < output_tuples.len() {
-            let end = start
-                + output_tuples[start..].partition_point(|(t, _)| *t == output_tuples[start].0);
-            let mut batch = output_tuples[start..end]
-                .iter_mut()
-                .map(|(_, tuple)| take(tuple))
-                .collect();
+
+        let mut batch = Vec::new();
+        while !output_tuples.is_empty() {
+            let batch_time = output_tuples[0].0.clone();
+
+            let end = output_tuples.partition_point(|(time, _)| *time == batch_time);
+            batch.extend(output_tuples.drain(..end).map(|(_, tuple)| tuple));
+
             self.output_batchers
-                .entry(output_tuples[start].0.clone())
+                .entry(batch_time)
                 .or_insert_with(|| Z::Batcher::new(()))
                 .push_batch(&mut batch);
-            start = end;
+            batch.clear();
         }
 
         // Finalize the batch for the current timestamp (`self.time`) and return it.

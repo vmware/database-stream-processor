@@ -27,12 +27,18 @@ impl<K: Ord + Clone, R: Eq + HasZero + AddAssignByRef + Clone> Trie for OrderedL
     type Cursor<'s> = OrderedLeafCursor<'s, K, R> where K: 's, R: 's;
     type MergeBuilder = OrderedLeafBuilder<K, R>;
     type TupleBuilder = UnorderedLeafBuilder<K, R>;
+
+    #[inline]
     fn keys(&self) -> usize {
         self.vals.len()
     }
+
+    #[inline]
     fn tuples(&self) -> usize {
         <OrderedLeaf<K, R> as Trie>::keys(self)
     }
+
+    #[inline]
     fn cursor_from(&self, lower: usize, upper: usize) -> Self::Cursor<'_> {
         OrderedLeafCursor {
             storage: self,
@@ -197,6 +203,12 @@ impl<K: Ord + Clone, R: Eq + HasZero + AddAssignByRef + Clone> MergeBuilder
             vals: Vec::with_capacity(cap),
         }
     }
+
+    #[inline]
+    fn reserve(&mut self, additional: usize) {
+        self.vals.reserve(additional);
+    }
+
     #[inline]
     fn copy_range(&mut self, other: &Self::Trie, lower: usize, upper: usize) {
         self.vals.extend_from_slice(&other.vals[lower..upper]);
@@ -391,25 +403,35 @@ where
     K: Eq + Ord + Clone,
     R: Clone,
 {
-    type Key = (K, R);
+    type Key<'k> = &'k (K, R)
+    where
+        Self: 'k;
     type ValueStorage = ();
 
     fn keys(&self) -> usize {
         self.bounds.1 - self.bounds.0
     }
-    fn key(&self) -> &'s Self::Key {
+
+    fn key(&self) -> Self::Key<'s> {
         &self.storage.vals[self.pos]
     }
+
     fn values(&self) {}
+
     fn step(&mut self) {
         self.pos += 1;
         if !self.valid() {
             self.pos = self.bounds.1;
         }
     }
-    fn seek(&mut self, key: &Self::Key) {
+
+    fn seek<'a>(&mut self, key: Self::Key<'a>)
+    where
+        's: 'a,
+    {
         self.seek_key(&key.0);
     }
+
     fn valid(&self) -> bool {
         self.pos < self.bounds.1
     }

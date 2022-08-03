@@ -4,6 +4,7 @@
 //! elements in the next layer. Similarly, ranges of elements in the layer
 //! itself may correspond to single elements in the layer above.
 
+pub mod column_leaf;
 pub mod ordered;
 pub mod ordered_leaf;
 // pub mod hashed;
@@ -81,9 +82,14 @@ pub trait MergeBuilder: Builder {
     /// Allocates an instance of the builder with sufficient capacity to contain
     /// the merged data.
     fn with_capacity(other1: &Self::Trie, other2: &Self::Trie) -> Self;
+
     fn with_key_capacity(cap: usize) -> Self;
+
+    fn reserve(&mut self, additional: usize);
+
     /// Copies sub-collections of `other` into this collection.
     fn copy_range(&mut self, other: &Self::Trie, lower: usize, upper: usize);
+
     /// Merges two sub-collections into one sub-collection.
     fn push_merge<'a>(
         &'a mut self,
@@ -112,24 +118,36 @@ pub trait TupleBuilder: Builder {
 /// other way, but the `Cursor` trait does not explain how this is so.
 pub trait Cursor<'s> {
     /// The type revealed by the cursor.
-    type Key;
+    type Key<'k>
+    where
+        Self: 'k;
+
     type ValueStorage: Trie;
 
     fn keys(&self) -> usize;
+
     /// Reveals the current key.
-    fn key(&self) -> &'s Self::Key;
+    fn key(&self) -> Self::Key<'s>;
 
     fn values(&self) -> <Self::ValueStorage as Trie>::Cursor<'s>;
 
     /// Advances the cursor by one element.
     fn step(&mut self);
+
     /// Advances the cursor until the location where `key` would be expected.
-    fn seek(&mut self, key: &Self::Key);
+    // FIXME: Attempted to allow `key` to have an arbitrary lifetime but
+    //        ran into some rather weird lifetime errors and gave up
+    fn seek<'a>(&mut self, key: Self::Key<'a>)
+    where
+        's: 'a;
+
     /// Returns `true` if the cursor points at valid data. Returns `false` if
     /// the cursor is exhausted.
     fn valid(&self) -> bool;
+
     /// Rewinds the cursor to its initial state.
     fn rewind(&mut self);
+
     /// Repositions the cursor to a different range of values.
     fn reposition(&mut self, lower: usize, upper: usize);
 }
@@ -200,8 +218,13 @@ impl Builder for () {
 
 impl MergeBuilder for () {
     fn with_capacity(_other1: &(), _other2: &()) -> Self {}
-    fn with_key_capacity(_cap: usize) -> Self {}
+
+    fn with_key_capacity(_capacity: usize) -> Self {}
+
+    fn reserve(&mut self, _additional: usize) {}
+
     fn copy_range(&mut self, _other: &Self::Trie, _lower: usize, _upper: usize) {}
+
     fn push_merge(
         &mut self,
         _other1: <Self::Trie as Trie>::Cursor<'static>,
@@ -223,18 +246,24 @@ impl TupleBuilder for () {
 }
 
 impl<'s> Cursor<'s> for () {
-    type Key = ();
+    type Key<'k> = &'k ();
     type ValueStorage = ();
 
     fn keys(&self) -> usize {
         0
     }
-    fn key(&self) -> &'s Self::Key {
+    fn key(&self) -> Self::Key<'s> {
         &()
     }
     fn values(&self) {}
     fn step(&mut self) {}
-    fn seek(&mut self, _key: &Self::Key) {}
+
+    fn seek<'a>(&mut self, _key: Self::Key<'a>)
+    where
+        's: 'a,
+    {
+    }
+
     fn valid(&self) -> bool {
         false
     }
